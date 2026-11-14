@@ -27,6 +27,8 @@ h2{font-size:.75rem;font-family:var(--font-mono);font-weight:500;letter-spacing:
 header{padding-block:32px 20px;display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--rule)}
 header p{margin:6px 0 0;color:var(--muted);max-width:62ch}
 .note{font-family:var(--font-mono);font-size:.75rem;color:var(--muted)}
+.notice{margin-top:20px;border:1px solid var(--warn);background:var(--warn-bg);color:var(--fg);padding:14px 16px;font-size:.875rem}
+.notice strong{color:var(--warn)}
 section{padding-block:28px 0}
 .panel{background:var(--surface);border:1px solid var(--rule)}
 .pipe{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0;border:1px solid var(--rule);background:var(--surface)}
@@ -83,6 +85,10 @@ td.mono{font-size:.8125rem}
   </div>
   <div class="note" id="cfg">loading</div>
 </header>
+
+<div class="notice" role="note">
+  <strong>Prototype notice.</strong> This page runs a working prototype that imitates the MuleSoft Anypoint integration layer described in the project document. It is written in Node.js and is not MuleSoft. It does not run on MuleSoft's platform and none of its flows are Mule applications. It runs the same behavior (gateway, queue, transformation, retry, dead-letter queue) so the design can be demonstrated and tested without a MuleSoft licence. The ERP is a mock of the SAP Business One Service Layer, the branch agents are simulated, data is kept in memory and resets when the service restarts, and no real EVER data, systems or credentials are used.
+</div>
 
 <section>
   <h2>Pipeline</h2>
