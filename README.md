@@ -1,6 +1,6 @@
 # EVER Integration Layer
 
-Prototype of the integration layer from the INTE 301 midterm case study. It sits between the legacy branch POS (Point of Sale) at three EVER Supermarket branches (Sucat, Zapote, 4th Estate) and SAP Business One.
+Prototype of the integration layer from the INTE 301 midterm case study. It imitates the MuleSoft Anypoint layer in the project document, is written in Node.js, and is not MuleSoft. It sits between the legacy branch POS (Point of Sale) at three EVER Supermarket branches (Sucat, Zapote, 4th Estate) and SAP Business One.
 
 The production design in the document uses MuleSoft Anypoint. This prototype runs the same flows in plain Node.js so the behavior can be demonstrated and tested without a MuleSoft licence. It has no dependencies and needs Node 20 or newer.
 
