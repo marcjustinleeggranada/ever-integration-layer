@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EVER Integration Layer</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#fafbfc; --surface:#ffffff; --fg:#14181f; --muted:#5a6472; --rule:#dde2e9; --accent:#1a4fd6; --accent-soft:#e8eefc;
+  --ok:#18794e; --ok-bg:#e4f4ec; --warn:#92580a; --warn-bg:#fbefd8; --bad:#b42318; --bad-bg:#fde7e4; --info:#1a4fd6; --info-bg:#e8eefc; --idle:#5a6472; --idle-bg:#eef1f5;
+  --font-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --font-mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0f1319; --surface:#161b23; --fg:#e8ecf2; --muted:#9aa5b4; --rule:#2a313c; --accent:#7ea2ff; --accent-soft:#1b2640;
+  --ok:#5fd39b; --ok-bg:#12281f; --warn:#f0b35a; --warn-bg:#2c2111; --bad:#ff8a7d; --bad-bg:#2f1815; --info:#7ea2ff; --info-bg:#1b2640; --idle:#9aa5b4; --idle-bg:#1d232d; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f1319; --surface:#161b23; --fg:#e8ecf2; --muted:#9aa5b4; --rule:#2a313c; --accent:#7ea2ff; --accent-soft:#1b2640;
+  --ok:#5fd39b; --ok-bg:#12281f; --warn:#f0b35a; --warn-bg:#2c2111; --bad:#ff8a7d; --bad-bg:#2f1815; --info:#7ea2ff; --info-bg:#1b2640; --idle:#9aa5b4; --idle-bg:#1d232d; color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--font-body);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:0 48px}
+.wrap{max-width:1080px;margin:0 auto}
+h1,h2,h3{margin:0;line-height:1.2}
+h1{font-size:1.75rem;font-weight:600;letter-spacing:-.01em}
+h2{font-size:.75rem;font-family:var(--font-mono);font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+.mono{font-family:var(--font-mono)}
+header{padding-block:32px 20px;display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--rule)}
+header p{margin:6px 0 0;color:var(--muted);max-width:62ch}
+.note{font-family:var(--font-mono);font-size:.75rem;color:var(--muted)}
+section{padding-block:28px 0}
+.panel{background:var(--surface);border:1px solid var(--rule)}
+.pipe{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0;border:1px solid var(--rule);background:var(--surface)}
+.pipe>div{padding:16px;border-right:1px solid var(--rule);min-width:0}
+.pipe>div:last-child{border-right:0}
+.pipe h3{font-size:.95rem;margin-bottom:2px}
+.pipe .sub{color:var(--muted);font-size:.8125rem;margin-bottom:10px}
+.kv{display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:.875rem}
+.kv span:nth-child(odd){color:var(--muted)}
+.kv span:nth-child(even){font-family:var(--font-mono);text-align:right}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0;border:1px solid var(--rule);background:var(--surface)}
+.tile{padding:14px 16px;border-right:1px solid var(--rule);border-bottom:1px solid var(--rule)}
+.tile b{display:block;font-family:var(--font-mono);font-size:1.5rem;font-weight:500;line-height:1.2}
+.tile span{font-size:.75rem;color:var(--muted)}
+.tile.bad b{color:var(--bad)} .tile.ok b{color:var(--ok)}
+.seg{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+button{font:inherit;color:var(--fg);background:var(--surface);border:1px solid var(--rule);padding:7px 12px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+button.small{padding:3px 8px;font-size:.8125rem}
+.scen{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:8px}
+.scen button{text-align:left;display:grid;grid-template-columns:48px 1fr;gap:8px;align-items:baseline}
+.scen .tc{font-family:var(--font-mono);font-size:.75rem;color:var(--accent)}
+.out{font-family:var(--font-mono);font-size:.8125rem;color:var(--muted);margin-top:10px;min-height:1.4em;overflow-wrap:anywhere}
+.tablewrap{overflow-x:auto;border:1px solid var(--rule);background:var(--surface);max-height:420px;overflow-y:auto}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:.875rem}
+th,td{text-align:left;padding:7px 12px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{position:sticky;top:0;background:var(--bg);font-family:var(--font-mono);font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
+tr.row{cursor:pointer} tr.row:hover td{background:var(--accent-soft)}
+td.mono{font-size:.8125rem}
+.pill{display:inline-block;font-family:var(--font-mono);font-size:.72rem;padding:1px 8px}
+.s-posted{background:var(--ok-bg);color:var(--ok)} .s-queued,.s-duplicate{background:var(--idle-bg);color:var(--idle)}
+.s-processing{background:var(--info-bg);color:var(--info)} .s-retrying{background:var(--warn-bg);color:var(--warn)}
+.s-dlq{background:var(--bad-bg);color:var(--bad)} .s-review{background:var(--warn-bg);color:var(--warn)}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}
+.list{border:1px solid var(--rule);background:var(--surface);min-height:60px}
+.list .item{padding:10px 12px;border-bottom:1px solid var(--rule);display:grid;gap:4px;font-size:.875rem}
+.list .item:last-child{border-bottom:0}
+.empty{padding:14px 12px;color:var(--muted);font-size:.875rem}
+.detail{margin-top:12px;border:1px solid var(--rule);background:var(--surface);padding:14px 16px;font-size:.875rem}
+.detail pre{margin:8px 0 0;font-family:var(--font-mono);font-size:.78rem;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted)}
+.detail ol{margin:8px 0 0;padding-left:1.2rem}
+.hint{color:var(--muted);font-size:.8125rem;margin:0 0 10px}
+@media(max-width:720px){.pipe>div{border-right:0;border-bottom:1px solid var(--rule)}.pipe>div:last-child{border-bottom:0}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div>
+    <h1>EVER Integration Layer</h1>
+    <p>Prototype of the layer between the legacy branch POS (Point of Sale) and SAP Business One for the three pilot branches. A built-in simulator plays the branch sync agents and the ERP (Enterprise Resource Planning) system, so every test case from the document can be run here.</p>
+  </div>
+  <div class="note" id="cfg">loading</div>
+</header>
+
+<section>
+  <h2>Pipeline</h2>
+  <div class="pipe">
+    <div><h3>1. API gateway</h3><div class="sub">Sign-in, rate limit, validation</div>
+      <div class="kv"><span>Rejected</span><span id="g-rej">0</span><span>Duplicates discarded</span><span id="g-dup">0</span><span>Rate limited</span><span id="g-rate">0</span></div></div>
+    <div><h3>2. Message queue</h3><div class="sub">Retry with backoff, dead-letter queue</div>
+      <div class="kv"><span>In flight or waiting</span><span id="q-depth">0</span><span>Retrying</span><span id="q-retry">0</span><span>Dead-letter</span><span id="q-dlq">0</span></div></div>
+    <div><h3>3. Transformation</h3><div class="sub">SKU map, weighed barcode, business day</div>
+      <div class="kv"><span>Sent to review</span><span id="t-rev">0</span><span>Posted</span><span id="t-posted">0</span></div></div>
+    <div><h3>4. Mock SAP Business One</h3><div class="sub">Service Layer stand-in</div>
+      <div class="kv"><span>Circuit breaker</span><span id="e-br">closed</span><span>Invoices posted</span><span id="e-inv">0</span><span>Pork stock (kg)</span><span id="e-stock">-</span></div>
+      <div class="seg" id="erpmode" role="group" aria-label="ERP behaviour">
+        <button type="button" data-m="up">Up</button><button type="button" data-m="flaky">Flaky</button><button type="button" data-m="down">Down</button><button type="button" data-m="expire">Expire session</button>
+      </div></div>
+  </div>
+</section>
+
+<section>
+  <h2>Health against the document goals</h2>
+  <div class="tiles">
+    <div class="tile ok"><b id="k-posted">0</b><span>Messages posted</span></div>
+    <div class="tile" id="k-g1t"><b id="k-g1">-</b><span>Posted within 5 min (G1 target 95%)</span></div>
+    <div class="tile"><b id="k-p95">-</b><span>95th percentile delay</span></div>
+    <div class="tile"><b id="k-min">0</b><span>Posted in the last minute</span></div>
+    <div class="tile" id="k-dlqt"><b id="k-dlq">0</b><span>In dead-letter queue</span></div>
+    <div class="tile"><b id="k-rev">0</b><span>In review queue</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Run a test case</h2>
+  <p class="hint">Each button sends real requests through the gateway as a branch agent, then the worker posts them to the mock ERP.</p>
+  <div class="scen" id="scen"></div>
+  <div class="out" id="out"></div>
+  <div class="seg">
+    <button type="button" id="reset">Reset everything</button>
+  </div>
+</section>
+
+<section>
+  <h2>Messages</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>ID</th><th>Branch</th><th>Type</th><th>Status</th><th>Tries</th><th>Detail</th><th>Age</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <div class="detail" id="detail" hidden></div>
+</section>
+
+<section class="two">
+  <div><h2>Dead-letter queue</h2><div class="list" id="dlq"></div></div>
+  <div><h2>Review queue</h2><div class="list" id="review"></div></div>
+</section>
+
+<section class="two">
+  <div>
+    <h2>End-of-day reconciliation</h2>
+    <p class="hint">Compares the branch file (what the till recorded, including sales still waiting) against what the ERP holds, using today's business day.</p>
+    <div class="seg" style="margin:0 0 10px"><button type="button" data-b="SUCAT">Sucat</button><button type="button" data-b="ZAPOTE">Zapote</button><button type="button" data-b="4TH_ESTATE">4th Estate</button></div>
+    <div class="list" id="recons"></div>
+  </div>
+  <div>
+    <h2>Price changes</h2>
+    <div class="list" id="prices"></div>
+  </div>
+</section>
+</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+  function post(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json()})}
+  function age(t){var s=Math.max(0,Math.round((Date.now()-t)/1000));return s<60?s+'s':Math.round(s/60)+'m'}
+  function ms(v){return v==null?'-':(v<1000?v+' ms':(v/1000).toFixed(1)+' s')}
+  function pill(s){return el('span','pill s-'+s,s)}
+  var selected=null,last=null;
+
+  fetch('/api/scenarios').then(function(r){return r.json()}).then(function(list){
+    list.forEach(function(s){
+      var b=el('button');b.type='button';b.appendChild(el('span','tc',s.tc));b.appendChild(el('span','',s.label));
+      b.addEventListener('click',function(){
+        $('out').textContent='Running '+s.tc+'...';
+        post('/sim/run/'+s.id).then(function(j){$('out').textContent=s.tc+': '+JSON.stringify(j).slice(0,400);tickNow()});
+      });
+      $('scen').appendChild(b);
+    });
+  });
+  $('reset').addEventListener('click',function(){post('/sim/reset').then(function(){selected=null;$('detail').hidden=true;$('out').textContent='State cleared.';tickNow()})});
+  $('erpmode').addEventListener('click',function(e){var m=e.target.getAttribute&&e.target.getAttribute('data-m');if(m)post('/sim/erp',{mode:m}).then(tickNow)});
+  document.querySelectorAll('[data-b]').forEach(function(b){b.addEventListener('click',function(){
+    post('/sim/recon',{branch:b.getAttribute('data-b')}).then(function(j){if(j.error)$('out').textContent='Reconciliation: '+j.error;tickNow()})})});
+
+  function fillList(node,items,build,emptyText){
+    node.textContent='';
+    if(!items.length){node.appendChild(el('div','empty',emptyText));return}
+    items.forEach(function(i){node.appendChild(build(i))});
+  }
+  function replayBtn(id){var b=el('button','small','Replay');b.type='button';b.addEventListener('click',function(){post('/api/messages/'+id+'/replay').then(tickNow)});return b}
+  function queueItem(m){
+    var d=el('div','item');var top=el('div');top.style.cssText='display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+    top.appendChild(el('span','mono',m.id));top.appendChild(el('span','',m.branch));top.appendChild(replayBtn(m.id));
+    d.appendChild(top);d.appendChild(el('div','',m.summary));d.appendChild(el('div','note',m.error||''));return d;
+  }
+  function render(s){
+    last=s;
+    var st=s.stats,by=st.byStatus;
+    $('cfg').textContent='retry schedule '+s.config.retrySchedule.join('s, ')+'s at '+(1/s.config.retryScale)+'x speed';
+    $('g-rej').textContent=st.rejected;$('g-dup').textContent=st.duplicates;$('g-rate').textContent=st.rateLimited;
+    $('q-depth').textContent=st.queueDepth;$('q-retry').textContent=by.retrying||0;$('q-dlq').textContent=by.dlq||0;
+    $('t-rev').textContent=by.review||0;$('t-posted').textContent=by.posted||0;
+    $('e-br').textContent=s.breaker.state+(s.breaker.state==='open'?' ('+Math.ceil(s.breaker.reopenInMs/1000)+'s)':'');
+    $('e-inv').textContent=st.erpInvoices;
+    $('e-stock').textContent=Object.keys(s.stock).map(function(k){return k.replace('_',' ').toLowerCase()+' '+s.stock[k]}).join(', ');
+    document.querySelectorAll('#erpmode button').forEach(function(b){
+      var m=b.getAttribute('data-m');b.classList.toggle('on',m===s.erp.mode||(m==='expire'&&s.erp.sessionExpired));
+    });
+    $('k-posted').textContent=by.posted||0;
+    $('k-g1').textContent=st.within5MinPct==null?'-':st.within5MinPct+'%';
+    $('k-g1t').className='tile'+(st.within5MinPct==null?'':(st.within5MinPct>=95?' ok':' bad'));
+    $('k-p95').textContent=ms(st.p95LatencyMs);$('k-min').textContent=st.postedLastMinute;
+    $('k-dlq').textContent=by.dlq||0;$('k-dlqt').className='tile'+((by.dlq||0)?' bad':'');
+    $('k-rev').textContent=by.review||0;
+
+    var tb=$('rows');tb.textContent='';
+    s.messages.forEach(function(m){
+      var tr=el('tr','row');tr.tabIndex=0;
+      tr.appendChild(el('td','mono',m.id));tr.appendChild(el('td','',m.branch));tr.appendChild(el('td','',m.type));
+      var c=el('td');c.appendChild(pill(m.status));tr.appendChild(c);
+      tr.appendChild(el('td','mono',String(m.attempts)));tr.appendChild(el('td','',m.error?m.summary+' | '+m.error:m.summary));
+      tr.appendChild(el('td','mono',age(m.createdAt)));
+      function open(){selected=m.id;showDetail()}
+      tr.addEventListener('click',open);tr.addEventListener('keydown',function(e){if(e.key==='Enter')open()});
+      tb.appendChild(tr);
+    });
+    if(!s.messages.length){var tr=el('tr');var td=el('td','empty','No messages yet. Run a test case above.');td.colSpan=7;tr.appendChild(td);tb.appendChild(tr)}
+
+    fillList($('dlq'),s.dlq,queueItem,'Empty. A message lands here after 5 failed attempts.');
+    fillList($('review'),s.review,queueItem,'Empty. Invalid data lands here instead of the ERP.');
+    fillList($('recons'),s.recons,function(r){
+      var d=el('div','item');var t=el('div');t.style.cssText='display:flex;gap:8px;align-items:center';
+      t.appendChild(el('span','pill '+(r.status==='OK'?'s-posted':'s-dlq'),r.status));t.appendChild(el('span','',r.branch+' · '+r.business_date));d.appendChild(t);
+      d.appendChild(el('div','mono','till ₱'+r.pos_total+' · ERP ₱'+r.erp_total+' · variance '+r.variance_pct+'% (limit 0.1%)'));
+      if(r.missing_in_erp.length)d.appendChild(el('div','note','Missing in ERP: '+r.missing_in_erp.slice(0,6).join(', ')+(r.missing_in_erp.length>6?' and '+(r.missing_in_erp.length-6)+' more':'')));
+      if(r.approval_mismatch.length)d.appendChild(el('div','note','Approval code mismatch: '+r.approval_mismatch.join(', ')));
+      return d;
+    },'No reconciliation run yet.');
+    fillList($('prices'),s.prices,function(p){
+      var d=el('div','item');d.appendChild(el('div','',p.item_code+' now ₱'+p.price));
+      var row=el('div');row.style.cssText='display:flex;gap:6px;flex-wrap:wrap';
+      Object.keys(p.deliveries).forEach(function(b){var dl=p.deliveries[b];
+        var secs=dl.ackedAt?((dl.ackedAt-p.createdAt)/1000).toFixed(1)+'s':'waiting';
+        row.appendChild(el('span','pill '+(dl.status==='acked'?'s-posted':'s-queued'),b.replace('_',' ')+' '+secs))});
+      d.appendChild(row);return d;
+    },'No price change yet. Run the TC4 test case.');
+    if(selected)showDetail(true);
+  }
+  function showDetail(quiet){
+    fetch('/api/messages/'+selected).then(function(r){return r.json()}).then(function(m){
+      var d=$('detail');
+      if(m.error&&!m.history){if(!quiet)d.hidden=true;return}
+      d.hidden=false;d.textContent='';
+      var h=el('div');h.style.cssText='display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+      h.appendChild(el('strong','mono',m.id));h.appendChild(pill(m.status));h.appendChild(el('span','note',m.key||''));d.appendChild(h);
+      var ol=el('ol');(m.history||[]).forEach(function(x){ol.appendChild(el('li','',x.t.slice(11,23)+'  '+x.event))});d.appendChild(ol);
+      d.appendChild(el('pre','',JSON.stringify(m.payload,null,2)));
+    });
+  }
+  var busy=false;
+  function tickNow(){
+    if(busy)return;busy=true;
+    fetch('/api/state').then(function(r){return r.json()}).then(render).catch(function(){}).then(function(){busy=false});
+  }
+  tickNow();setInterval(tickNow,1000);
+})();
+</script>
+</body>
+</html>

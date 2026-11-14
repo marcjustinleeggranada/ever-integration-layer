@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+.DS_Store
+*.log
+.cursor/
+.claude/
+.windsurf/
+.aider*
+.continue/
+.codeium/
+.copilot/
