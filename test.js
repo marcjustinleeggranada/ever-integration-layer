@@ -68,7 +68,7 @@ const erpMode = (mode) => api('/sim/erp', { method: 'POST', body: { mode } });
 
     await check('TC3 500 sales buffered during an outage all arrive once after reconnect, within 5 minutes', async () => {
       await reset();
-      await run('outage', { count: 500 });
+      await run('replay', { count: 500 });
       await waitFor(async () => (await invoices()).length === 500, '500 invoices', 30000);
       const list = await invoices();
       assert.strictEqual(new Set(list.map((i) => i.U_InvoiceNo)).size, 500);
@@ -76,26 +76,63 @@ const erpMode = (mode) => api('/sim/erp', { method: 'POST', body: { mode } });
       assert.strictEqual(s.within5MinPct, 100);
     });
 
-    await check('TC4 a price change reaches all 3 pilot branches', async () => {
+    await check('TC4 a price change reaches all 3 pilot branches, and a future-dated change stays pending', async () => {
       await reset();
       await run('promo');
-      await waitFor(async () => { const p = (await state()).prices[0]; return p && Object.values(p.deliveries).every((d) => d.status === 'acked'); }, 'acks', 10000);
+      await waitFor(async () => { const p = (await state()).prices.find((x) => x.status === 'applied'); return p && Object.values(p.deliveries).every((d) => d.status === 'acked'); }, 'acks', 10000);
+      const prices = (await state()).prices;
+      assert.strictEqual(prices.filter((p) => p.status === 'pending').length, 1);
+      assert.strictEqual(prices.find((p) => p.status === 'pending').itemCode, 'ITM-6001');
+      assert.strictEqual((await state()).counts.prices, 1);
     });
 
-    await check('TC5 an unmapped SKU lands in the review queue, not the ERP', async () => {
+    await check('TC5 an unknown POS code waits in the review queue with a suggestion; accepting the mapping posts it', async () => {
       await reset();
       await run('unmapped');
       await waitFor(async () => (await state()).review.length === 1, 'review item');
       assert.strictEqual((await invoices()).length, 0);
-      assert.match((await state()).review[0].error, /Unmapped SKU ZZZ-9999/);
+      const item = (await state()).review[0];
+      assert.strictEqual(item.review.kind, 'unmapped');
+      assert.strictEqual(item.review.sku, '480012');
+      assert.strictEqual(item.review.suggestion.itemCode, 'ITM-1042');
+      assert.match(item.id, /^\d+$/);
+      const r = await api(`/api/messages/${item.id}/decide`, { method: 'POST', body: { action: 'accept-mapping' } });
+      assert.strictEqual(r.status, 200);
+      await waitFor(async () => (await invoices()).length === 1, 'posted after mapping');
+      assert.strictEqual((await invoices())[0].DocumentLines[0].ItemCode, 'ITM-1042');
+      // the mapping is kept: a second sale with the same code now goes straight through
+      await run('unmapped');
+      await waitFor(async () => (await invoices()).length === 2, 'second sale posts on its own');
+      assert.strictEqual((await state()).review.length, 0);
     });
 
-    await check('TC6 sales across 12:00 AM at Zapote land on the right business day', async () => {
+    await check('TC5 rejecting an unknown POS code ends it without posting', async () => {
+      await reset();
+      await run('unmapped');
+      await waitFor(async () => (await state()).review.length === 1, 'review item');
+      const id = (await state()).review[0].id;
+      await api(`/api/messages/${id}/decide`, { method: 'POST', body: { action: 'reject' } });
+      await sleep(300);
+      const s = await state();
+      assert.strictEqual(s.review.length, 0);
+      assert.strictEqual(s.messages.find((m) => m.id === id).status, 'rejected');
+      assert.strictEqual((await invoices()).length, 0);
+    });
+
+    await check('TC6 sales either side of 12:00 AM at Zapote are held until a person picks the business day', async () => {
       await reset();
       await run('midnight');
+      await waitFor(async () => (await state()).review.length === 2, 'two held sales');
+      assert.strictEqual((await invoices()).length, 0);
+      const held = (await state()).review;
+      assert.ok(held.every((m) => m.review.kind === 'midnight' && m.review.days.length === 2));
+      const [d1, d2] = held[0].review.days;
+      await api(`/api/messages/${held[0].id}/decide`, { method: 'POST', body: { action: 'use-day', day: d1 } });
+      await api(`/api/messages/${held[1].id}/decide`, { method: 'POST', body: { action: 'use-day', day: d2 } });
       await waitFor(async () => (await invoices()).length === 2, 'two invoices');
-      const days = (await invoices()).map((i) => i.DocDate).sort();
-      assert.deepStrictEqual(days, ['2026-11-15', '2026-11-16']);
+      assert.deepStrictEqual((await invoices()).map((i) => i.DocDate).sort(), [d1, d2].sort());
+      const bad = await api(`/api/messages/${held[0].id}/decide`, { method: 'POST', body: { action: 'use-day', day: d1 } });
+      assert.strictEqual(bad.status, 409);
     });
 
     await check('TC7 a debit sale labelled "Credit Card" keeps its approval code, and reconciliation matches on it', async () => {
@@ -147,14 +184,45 @@ const erpMode = (mode) => api('/sim/erp', { method: 'POST', body: { mode } });
 
     await check('Dead-letter queue: after 5 failed attempts a sale is parked, then replays after the fix', async () => {
       await reset();
-      await erpMode('down');
-      await run('weighed');
+      await run('outage');
       await waitFor(async () => (await state()).dlq.length === 1, 'dead-letter item', 40000);
       const item = (await state()).dlq[0];
       assert.strictEqual(item.attempts, 5);
+      assert.strictEqual(item.label, 'Weighed');
+      assert.strictEqual((await state()).counts.dlq, 1);
       await erpMode('up');
-      await api(`/api/messages/${item.id}/replay`, { method: 'POST', body: {} });
+      await api('/api/dlq/retry-all', { method: 'POST', body: {} });
       await waitFor(async () => (await invoices()).length === 1, 'replayed invoice', 15000);
+      assert.strictEqual((await state()).dlq.length, 0);
+    });
+
+    await check('Dead-letter queue: a parked message can be discarded', async () => {
+      await reset();
+      await run('outage');
+      await waitFor(async () => (await state()).dlq.length === 1, 'dead-letter item', 40000);
+      const id = (await state()).dlq[0].id;
+      assert.strictEqual((await api(`/api/messages/${id}/discard`, { method: 'POST', body: {} })).status, 200);
+      const s = await state();
+      assert.strictEqual(s.dlq.length, 0);
+      assert.strictEqual(s.messages.find((m) => m.id === id).status, 'discarded');
+      await erpMode('up');
+    });
+
+    await check('Reconciliation breakdown lists sales still waiting, and the totals agree once they post', async () => {
+      await reset();
+      await erpMode('down');
+      await run('normal');
+      await sleep(300);
+      const b = (await state()).messages[0].branch;
+      const r = (await api(`/api/reconciliation?branch=${b}`)).json;
+      assert.strictEqual(r.rows.length, 5);
+      assert.ok(r.branchFile > 0 && r.erpPosted === 0 && r.difference === r.branchFile);
+      assert.ok(r.rows.every((x) => x.reason === 'Waiting in queue' || x.reason === 'Retrying'));
+      await erpMode('up');
+      await waitFor(async () => (await state()).stats.byStatus.posted === 5, 'all posted', 20000);
+      const r2 = (await api(`/api/reconciliation?branch=${b}`)).json;
+      assert.strictEqual(r2.difference, 0);
+      assert.strictEqual(r2.rows.length, 0);
     });
   } finally {
     child.kill();

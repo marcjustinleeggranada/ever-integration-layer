@@ -1,13 +1,13 @@
 # EVER Integration Layer
 
-Prototype of the integration layer from the INTE 301 midterm case study. It imitates the MuleSoft Anypoint layer in the project document, is written in Node.js, and is not MuleSoft. It sits between the legacy branch POS (Point of Sale) at three EVER Supermarket branches (Sucat, Zapote, 4th Estate) and SAP Business One.
+Prototype of the integration layer from the INTE 301 midterm case study. It sits between the legacy branch POS (Point of Sale) at three EVER Supermarket branches (Sucat, Zapote, 4th Estate) and SAP Business One.
 
 The production design in the document uses MuleSoft Anypoint. This prototype runs the same flows in plain Node.js so the behavior can be demonstrated and tested without a MuleSoft licence. It has no dependencies and needs Node 20 or newer.
 
 ## Run it
 
     npm start        # http://localhost:3000
-    npm test         # 13 end-to-end checks, starts its own server
+    npm test         # 16 end-to-end checks, starts its own server
 
 Environment variables: `PORT`, `RETRY_SCALE` (1 is the real retry schedule, default 0.1 runs ten times faster), `RATE_LIMIT` (requests per minute per client, default 600).
 
@@ -20,7 +20,7 @@ Environment variables: `PORT`, `RETRY_SCALE` (1 is the real retry schedule, defa
 | Transformation | `transformSale` | Legacy SKU to ERP item code, weighed-item barcode parsing, 12:00 AM business-day cutoff |
 | Mock ERP | `/sap/b1s/v1/*` | Stand-in for the SAP Business One Service Layer: Invoices, InventoryPostings, Items, Login |
 | Simulator | `/sim/*` | Plays the branch sync agents and the ERP team so each test case can be run from the dashboard |
-| Dashboard | `/` | Live view of queue, ERP state, messages, dead-letter and review queues, reconciliation, price changes |
+| Dashboard | `/` | Dark app with seven views: Overview, Messages, Dead-letter (retry or discard), Review (accept a mapping, reject, or pick a business day), Reconciliation (branch file against ERP, with reasons for the gap), Price changes (pending or applied), Test cases (run each case, set the mock ERP to Up, Flaky or Down, expire its session) |
 
 State lives in memory and resets when the process restarts.
 
@@ -32,7 +32,7 @@ All `/v1` routes need `Authorization: Bearer <token>`. Get a token with `POST /o
 |---|---|---|
 | `POST /v1/sales` | branch agent | Batch of sales, flow F1. Returns 202 with a status per sale: accepted, duplicate, or rejected |
 | `POST /v1/stock-movements` | branch agent | Receipts, transfers, adjustments, flow F2 |
-| `POST /v1/prices` | ERP | Approve a price change, flow F3 |
+| `POST /v1/prices` | ERP | Approve a price change, flow F3. Optional `starts_on` (YYYY-MM-DD, Philippine date) keeps it pending until that day |
 | `GET /v1/price-updates` and `POST /v1/price-updates/:id/ack` | branch agent | Fetch pending price changes and acknowledge them |
 | `POST /v1/reconciliation` | branch agent | End-of-day file as JSON rows or CSV text, flow F6. Returns variance and a status of OK or FLAG |
 
@@ -68,16 +68,27 @@ The idempotency key is the branch, terminal and invoice number. A weighed-item b
 | TC1 | Barcode price 135.00 at 450.00 per kilo deducts 0.30 kg from the earliest-expiry batch |
 | TC2 | Same invoice sent 3 times posts once, 2 duplicates acknowledged |
 | TC3 | 500 sales buffered in an outage arrive once each, all within 5 minutes |
-| TC4 | A price change is acknowledged by all 3 branches |
-| TC5 | An unmapped SKU goes to the review queue, not the ERP |
-| TC6 | Sales at 11:59:59 PM and 12:00:01 AM land on different business days |
+| TC4 | A price change is acknowledged by all 3 branches, and a future-dated change stays pending |
+| TC5 | An unknown POS code waits in the review queue with a suggested mapping. Accepting it posts the sale and remembers the mapping. Rejecting ends it without posting |
+| TC6 | Sales within a minute of 12:00 AM are held in the review queue until a person picks the business day. The chosen day becomes the ERP document date |
 | TC7 | A debit sale labelled "Credit Card" keeps its approval code, and reconciliation matches on it |
 
-The suite also checks gateway sign-in, input validation, reconciliation variance, ERP session expiry with one re-login, the circuit breaker, and the dead-letter queue with manual replay.
+The suite also checks gateway sign-in, input validation, reconciliation variance, ERP session expiry with one re-login, the circuit breaker, the dead-letter queue with retry, retry all and discard, and the reconciliation breakdown that lists sales still waiting in the queue.
+
+## Operator routes used by the dashboard
+
+| Route | Purpose |
+|---|---|
+| `GET /api/state` | Counts, messages, queues, prices, ERP status |
+| `GET /api/reconciliation?branch=SUCAT&date=2026-11-23` | Branch file total, ERP posted total, difference, and why each missing sale is not posted |
+| `POST /api/messages/:id/decide` | Review queue decision: `{"action":"accept-mapping"}`, `{"action":"reject"}`, or `{"action":"use-day","day":"2026-11-23"}` |
+| `POST /api/messages/:id/replay` and `/discard` | Retry or discard a dead-letter message |
+| `POST /api/dlq/retry-all` | Requeue every dead-letter message |
+| `POST /sim/run/:case`, `/sim/erp`, `/sim/reset`, `/sim/price` | Simulator controls |
 
 ## What is simulated
 
-- The ERP is a mock with five items and three branches. It has no real SAP behavior beyond the document shapes used here.
+- The ERP is a mock with six items and three branches. It has no real SAP behavior beyond the document shapes used here.
 - The queue is in memory. A production build would use a durable broker.
 - The SFTP end-of-day file is sent as an HTTPS upload to `/v1/reconciliation`.
 - Loyalty, supplier ordering, and Maya, GCash and card payments are outside this prototype.

@@ -35,8 +35,11 @@ const CLIENTS = {
 const BRANCHES = ['SUCAT', 'ZAPOTE', '4TH_ESTATE'];
 
 /* ---------- reference data ---------- */
-const SKU_MAP = { 'PRK-0042': 'ITM-1042', 'MLK-0100': 'ITM-2100', 'RCE-0005': 'ITM-3005', 'SRD-0010': 'ITM-4010', 'WTR-0001': 'ITM-5001' };
-const WEIGHED_MAP = { '000042': 'ITM-1042' };
+const BASE_SKU_MAP = { 'PRK-0042': 'ITM-1042', 'MLK-0100': 'ITM-2100', 'RCE-0005': 'ITM-3005', 'SRD-0010': 'ITM-4010', 'WTR-0001': 'ITM-5001', 'OIL-0001': 'ITM-6001' };
+const BASE_WEIGHED_MAP = { '000042': 'ITM-1042' };
+const BASE_SKUS = ['MLK-0100', 'RCE-0005', 'SRD-0010', 'WTR-0001']; // used for random sales, so accepted mappings never leak into them
+let SKU_MAP = { ...BASE_SKU_MAP };
+let WEIGHED_MAP = { ...BASE_WEIGHED_MAP };
 
 function freshErp() {
   const items = {
@@ -45,6 +48,7 @@ function freshErp() {
     'ITM-3005': { name: 'Rice 5kg', uom: 'PC', price: 310 },
     'ITM-4010': { name: 'Canned sardines', uom: 'PC', price: 28 },
     'ITM-5001': { name: 'Bottled water 500ml', uom: 'PC', price: 20 },
+    'ITM-6001': { name: 'Cooking oil 1L', uom: 'PC', price: 98 },
   };
   const stock = {};
   for (const b of BRANCHES) {
@@ -67,16 +71,23 @@ let rate = new Map();
 let recons = [];
 let counters = { duplicates: 0, rejected: 0, rateLimited: 0 };
 let breaker = { state: 'closed', fails: [], until: 0, probing: false };
-let seq = 0;
+let seq = 1000;
+let priceChanges = [];
 
 /* ---------- helpers ---------- */
 const now = () => Date.now();
 const iso = (t = now()) => new Date(t).toISOString();
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 const round3 = (n) => Math.round((n + Number.EPSILON) * 1000) / 1000;
-const uid = () => 'M' + String(++seq).padStart(6, '0');
-const businessDay = (ts) => new Date(Date.parse(ts) + TZ_OFFSET_MS).toISOString().slice(0, 10);
-const verr = (msg) => Object.assign(new Error(msg), { validation: true });
+const uid = () => String(++seq);
+const dayAt = (ms) => new Date(ms + TZ_OFFSET_MS).toISOString().slice(0, 10);
+const businessDay = (ts) => dayAt(Date.parse(ts));
+const verr = (msg, review) => Object.assign(new Error(msg), { validation: true, review: review || { kind: 'invalid' } });
+const MIDNIGHT_GUARD_MS = 60 * 1000; // a sale this close to 12:00 AM is held until a person picks the business day
+const nearMidnight = (ms) => dayAt(ms - MIDNIGHT_GUARD_MS) !== dayAt(ms + MIDNIGHT_GUARD_MS);
+const itemPrice = (it) => (it.pricePerKg !== undefined ? it.pricePerKg : it.price);
+const itemLabel = (it) => it.name + (it.uom === 'KG' ? ', per kg' : '');
+const dayOf = (m) => m.dayChoice || businessDay(m.payload.timestamp);
 
 function ean13(d12) {
   let s = 0;
@@ -127,7 +138,7 @@ function limited(clientId) {
 
 /* ---------- messages ---------- */
 function addMessage(type, branch, key, payload) {
-  const m = { id: uid(), type, branch, key, status: 'queued', attempts: 0, nextAt: 0, error: null, createdAt: now(), postedAt: null, payload, result: null, history: [] };
+  const m = { id: uid(), type, branch, key, status: 'queued', attempts: 0, nextAt: 0, error: null, createdAt: now(), postedAt: null, lastAttemptAt: null, review: null, dayChoice: null, payload, result: null, history: [] };
   log(m, 'accepted by gateway');
   messages.set(m.id, m);
   order.push(m.id);
@@ -135,7 +146,7 @@ function addMessage(type, branch, key, payload) {
   if (order.length > MAX_KEPT) {
     for (let i = 0; i < order.length && order.length > MAX_KEPT; i++) {
       const old = messages.get(order[i]);
-      if (old && (old.status === 'posted' || old.status === 'duplicate')) {
+      if (old && ['posted', 'duplicate', 'rejected', 'discarded'].includes(old.status)) {
         messages.delete(old.id);
         if (old.key && keyIndex.get(old.key) === old.id) keyIndex.delete(old.key);
         order.splice(i, 1); i--;
@@ -146,7 +157,7 @@ function addMessage(type, branch, key, payload) {
 }
 function addDuplicate(branch, key, payload) {
   const original = messages.get(keyIndex.get(key));
-  const m = { id: uid(), type: 'duplicate', branch, key, status: 'duplicate', attempts: 0, nextAt: 0, error: null, createdAt: now(), postedAt: now(), payload, result: { duplicateOf: original ? original.id : null }, history: [] };
+  const m = { id: uid(), type: 'duplicate', branch, key, status: 'duplicate', attempts: 0, nextAt: 0, error: null, createdAt: now(), postedAt: now(), lastAttemptAt: null, review: null, dayChoice: null, payload, result: { duplicateOf: original ? original.id : null }, history: [] };
   log(m, 'same idempotency key already seen, acknowledged and discarded');
   messages.set(m.id, m); order.push(m.id);
   counters.duplicates += 1;
@@ -154,17 +165,46 @@ function addDuplicate(branch, key, payload) {
 }
 
 /* ---------- transformation ---------- */
+function saleDay(m) {
+  if (m.dayChoice) return m.dayChoice;
+  const t = Date.parse(m.payload.timestamp);
+  const before = dayAt(t - MIDNIGHT_GUARD_MS); const after = dayAt(t + MIDNIGHT_GUARD_MS);
+  if (before !== after) throw verr('Sale time falls near midnight', { kind: 'midnight', days: [before, after] });
+  return dayAt(t);
+}
+function suggestItem(text) {
+  const words = new Set(String(text || '').toLowerCase().match(/[a-z]{3,}/g) || []);
+  let best = null; let bestScore = 0;
+  for (const [code, it] of Object.entries(erp.items)) {
+    const score = (it.name.toLowerCase().match(/[a-z]{3,}/g) || []).filter((w) => words.has(w)).length;
+    if (score > bestScore) { best = code; bestScore = score; }
+  }
+  if (!best) return null;
+  const sku = Object.keys(SKU_MAP).find((k) => SKU_MAP[k] === best) || null;
+  return { itemCode: best, itemName: erp.items[best].name, sku };
+}
+function saleAmount(s) {
+  if (s.total !== undefined && !Number.isNaN(Number(s.total))) return round2(Number(s.total));
+  let t = 0;
+  for (const l of s.lines || []) {
+    if (l.barcode) t += (Number(String(l.barcode).slice(7, 12)) || 0) / 100;
+    else if (l.amount !== undefined) t += Number(l.amount) || 0;
+    else { const it = erp.items[SKU_MAP[l.sku]]; if (it) t += round2((Number(l.qty) || 0) * itemPrice(it)); }
+  }
+  return round2(t);
+}
 function transformSale(m) {
   const s = m.payload;
   const lines = [];
   let total = 0;
+  const docDate = saleDay(m);
   for (const l of s.lines) {
     if (l.barcode) {
       const b = String(l.barcode);
       if (!/^2\d{12}$/.test(b)) throw verr(`Barcode ${b} is not a weighed-item barcode`);
       if (ean13(b.slice(0, 12)) !== b) throw verr(`Barcode ${b} fails its check digit`);
       const code = WEIGHED_MAP[b.slice(1, 7)];
-      if (!code) throw verr(`Unmapped weighed item code ${b.slice(1, 7)}`);
+      if (!code) throw verr(`Unmapped weighed item code ${b.slice(1, 7)}`, { kind: 'unmapped', sku: b.slice(1, 7), weighed: true, suggestion: suggestItem(l.description) });
       const price = Number(b.slice(7, 12)) / 100;
       const perKg = erp.items[code].pricePerKg;
       const qty = round3(price / perKg);
@@ -173,10 +213,10 @@ function transformSale(m) {
       total += price;
     } else {
       const code = SKU_MAP[l.sku];
-      if (!code) throw verr(`Unmapped SKU ${l.sku}`);
+      if (!code) throw verr(`POS code ${l.sku} has no SKU match`, { kind: 'unmapped', sku: String(l.sku), weighed: false, suggestion: suggestItem(l.description) });
       const qty = Number(l.qty);
       if (!(qty > 0)) throw verr(`Quantity must be above zero for ${l.sku}`);
-      const unit = erp.items[code].price;
+      const unit = itemPrice(erp.items[code]);
       const amount = l.amount !== undefined ? Number(l.amount) : round2(qty * unit);
       lines.push({ ItemCode: code, Quantity: qty, UoM: erp.items[code].uom, LineTotal: amount, Source: 'sku-map' });
       total += amount;
@@ -187,13 +227,13 @@ function transformSale(m) {
   return {
     U_TransactionKey: m.key, U_InvoiceNo: s.invoice_no, U_PosTxnNo: s.pos_transaction_no || null, U_Terminal: s.terminal,
     U_TenderType: s.tender_type, U_ApprovalCode: s.approval_code || null, U_Member: s.member_number || null,
-    DocDate: businessDay(s.timestamp), BranchCode: m.branch, DocTotal: total, DocumentLines: lines,
+    DocDate: docDate, BranchCode: m.branch, DocTotal: total, DocumentLines: lines,
   };
 }
 function transformMovement(m) {
   const s = m.payload;
   const code = SKU_MAP[s.sku];
-  if (!code) throw verr(`Unmapped SKU ${s.sku}`);
+  if (!code) throw verr(`POS code ${s.sku} has no SKU match`, { kind: 'unmapped', sku: String(s.sku), weighed: false, suggestion: suggestItem(s.description) });
   const qty = Number(s.qty);
   if (!(qty !== 0) || Number.isNaN(qty)) throw verr('Quantity must not be zero');
   return { U_TransactionKey: m.key, BranchCode: m.branch, Type: s.type, ItemCode: code, Quantity: qty, BatchNumber: s.batch || 'B-STD', ExpiryDate: s.expiry || null };
@@ -219,11 +259,14 @@ function breakerFail() {
 }
 function breakerOk() { breaker.state = 'closed'; breaker.fails = []; }
 
-function toReview(m, why) {
-  m.status = 'review'; m.error = why; log(m, `validation failed, sent to review queue: ${why}`);
+function toReview(m, why, info) {
+  m.status = 'review'; m.error = why; m.review = info || { kind: 'invalid' }; log(m, `needs a decision, sent to review queue: ${why}`);
+}
+function requeue(m, note) {
+  m.status = 'queued'; m.attempts = 0; m.nextAt = 0; m.error = null; m.review = null; log(m, note);
 }
 function toRetryOrDlq(m, why) {
-  m.attempts += 1; m.error = why;
+  m.attempts += 1; m.error = why; m.lastAttemptAt = now();
   if (m.attempts >= MAX_ATTEMPTS) { m.status = 'dlq'; log(m, `attempt ${m.attempts} failed (${why}), moved to dead-letter queue`); return; }
   const wait = BASE_DELAYS[m.attempts - 1] * 1000 * SCALE;
   m.status = 'retrying'; m.nextAt = now() + wait;
@@ -239,7 +282,7 @@ async function processMessage(m) {
     else if (m.type === 'stock') { doc = transformMovement(m); target = 'InventoryPostings'; }
     else { m.status = 'posted'; return; }
   } catch (e) {
-    if (e.validation) return toReview(m, e.message);
+    if (e.validation) return toReview(m, e.message, e.review);
     return toRetryOrDlq(m, 'transformation error: ' + e.message);
   }
   log(m, 'transformed for the ERP');
@@ -349,6 +392,20 @@ async function sapRoute(req, res, url) {
   send(res, 404, { error: 'Unknown Service Layer resource' });
 }
 
+/* ---------- price changes ---------- */
+function applyPrice(rec) {
+  const it = erp.items[rec.itemCode];
+  rec.old = itemPrice(it);
+  if (it.pricePerKg !== undefined) it.pricePerKg = rec.new; else it.price = rec.new;
+  const m = addMessage('price', 'ALL', null, { item_code: rec.itemCode, price: rec.new, change_id: rec.id });
+  m.status = 'posted'; m.postedAt = now();
+  m.deliveries = Object.fromEntries(BRANCHES.map((br) => [br, { status: 'pending', ackedAt: null }]));
+  log(m, 'price change approved in the ERP and queued for all branch agents');
+  rec.status = 'applied'; rec.appliedAt = now(); rec.messageId = m.id;
+  simulateAgentAcks(m.id);
+}
+setInterval(() => { for (const r of priceChanges) if (r.status === 'pending' && r.startsOn <= dayAt(now())) applyPrice(r); }, 1000).unref();
+
 /* ---------- gateway routes ---------- */
 function validSale(s) {
   if (!s || typeof s !== 'object') return 'sale must be an object';
@@ -411,12 +468,11 @@ async function gateway(req, res, url) {
     const b = await readJson(req);
     const it = erp.items[b.item_code];
     if (!it || !(Number(b.price) > 0)) return send(res, 400, { error: 'item_code and a positive price are required' });
-    if (it.pricePerKg !== undefined) it.pricePerKg = Number(b.price); else it.price = Number(b.price);
-    const m = addMessage('price', 'ALL', null, { item_code: b.item_code, price: Number(b.price) });
-    m.status = 'posted'; m.postedAt = now();
-    m.deliveries = Object.fromEntries(BRANCHES.map((br) => [br, { status: 'pending', ackedAt: null }]));
-    log(m, 'price change approved in the ERP and queued for all branch agents');
-    return send(res, 202, { id: m.id });
+    if (b.starts_on !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(b.starts_on))) return send(res, 400, { error: 'starts_on must be a date like 2026-11-30 (Philippine date)' });
+    const rec = { id: uid(), itemCode: b.item_code, label: itemLabel(it), old: itemPrice(it), new: Number(b.price), startsOn: b.starts_on || dayAt(now()), status: 'pending', appliedAt: null, messageId: null };
+    priceChanges.push(rec);
+    if (rec.startsOn <= dayAt(now())) applyPrice(rec);
+    return send(res, 202, { id: rec.id, status: rec.status, message_id: rec.messageId });
   }
   if (url.pathname === '/v1/price-updates' && req.method === 'GET') {
     if (!client.branch) return send(res, 403, { error: 'Only branch agents can fetch price updates' });
@@ -474,22 +530,88 @@ function stats() {
     erpInvoices: erp.invoices.length,
   };
 }
-const view = (m) => ({ id: m.id, type: m.type, branch: m.branch, key: m.key, status: m.status, attempts: m.attempts, error: m.error, createdAt: m.createdAt, postedAt: m.postedAt, nextAt: m.nextAt, summary: summary(m) });
-function summary(m) {
+function labelOf(m) {
   const p = m.payload || {};
-  if (m.type === 'sale') return `${p.invoice_no} · ${p.tender_type}${p.approval_code ? ' ' + p.approval_code : ''} · ${p.lines ? p.lines.length : 0} line(s)`;
-  if (m.type === 'stock') return `${p.type} ${p.doc_no} · ${p.sku} × ${p.qty}`;
-  if (m.type === 'price') return `${p.item_code} to ₱${p.price}`;
-  return m.type === 'duplicate' ? `duplicate of ${m.result && m.result.duplicateOf}` : '';
+  const t = m.type === 'duplicate' ? (p.lines ? 'sale' : 'stock') : m.type;
+  if (t === 'sale') return (p.lines || []).some((l) => l.barcode) ? 'Weighed' : 'Sale';
+  return t === 'stock' ? 'Stock' : 'Price';
+}
+function describeLine(l) {
+  if (l.barcode) {
+    const b = String(l.barcode); const code = WEIGHED_MAP[b.slice(1, 7)]; const it = code && erp.items[code];
+    if (!it) return l.description || `Weighed code ${b.slice(1, 7)}`;
+    return `${it.name}, ${(Number(b.slice(7, 12)) / 100 / it.pricePerKg).toFixed(2)} kg`;
+  }
+  const it = erp.items[SKU_MAP[l.sku]];
+  if (!it) return l.description || `POS code ${l.sku}`;
+  return `${it.name}, ${l.qty}${it.uom === 'KG' ? ' kg' : ' pc'}`;
+}
+function describe(m) {
+  const p = m.payload || {};
+  if (m.type === 'sale' || (m.type === 'duplicate' && p.lines)) {
+    const first = describeLine(p.lines[0]);
+    return p.lines.length > 1 ? `${first} and ${p.lines.length - 1} more` : first;
+  }
+  if (m.type === 'stock' || m.type === 'duplicate') return `${p.type} ${p.doc_no}, ${p.sku} x ${p.qty}`;
+  if (m.type === 'price') { const it = erp.items[p.item_code]; return `${it ? it.name : p.item_code} to ${peso(p.price)}`; }
+  return '';
+}
+const peso = (n) => '₱' + Number(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
+const view = (m) => ({
+  id: m.id, type: m.type, label: labelOf(m), detail: describe(m), branch: m.branch, key: m.key, status: m.status, attempts: m.attempts, error: m.error,
+  createdAt: m.createdAt, postedAt: m.postedAt, nextAt: m.nextAt, lastAttemptAt: m.lastAttemptAt, review: m.review, dayChoice: m.dayChoice,
+  amount: m.type === 'sale' ? saleAmount(m.payload) : null, duplicateOf: m.type === 'duplicate' && m.result ? m.result.duplicateOf : null,
+});
+const MSG_STATES = { queued: 'Waiting in queue', processing: 'Waiting in queue', retrying: 'Retrying', dlq: 'Dead-letter', review: 'In review queue' };
+function reconciliation(branch, date) {
+  const sales = order.map((id) => messages.get(id)).filter((m) => m && m.type === 'sale' && m.branch === branch && !['rejected', 'discarded'].includes(m.status));
+  const invoices = erp.invoices.filter((i) => i.BranchCode === branch);
+  const days = [...new Set([...sales.map(dayOf), ...invoices.map((i) => i.DocDate)])].sort().reverse();
+  const day = date && days.includes(date) ? date : days[0] || dayAt(now());
+  const mine = sales.filter((m) => dayOf(m) === day);
+  const branchFile = round2(mine.reduce((t, m) => t + saleAmount(m.payload), 0));
+  const erpPosted = round2(invoices.filter((i) => i.DocDate === day).reduce((t, i) => t + i.DocTotal, 0));
+  const rows = mine.filter((m) => MSG_STATES[m.status]).map((m) => ({ id: m.id, amount: saleAmount(m.payload), reason: MSG_STATES[m.status] }));
+  return { branch, day, days, branchFile, erpPosted, difference: round2(branchFile - erpPosted), rows, salesCount: mine.length };
+}
+function stats() {
+  const all = order.map((id) => messages.get(id)).filter(Boolean);
+  const by = {};
+  for (const m of all) by[m.status] = (by[m.status] || 0) + 1;
+  const posted = all.filter((m) => m.status === 'posted' && m.type !== 'price');
+  const lat = posted.map((m) => m.postedAt - m.createdAt).sort((a, b) => a - b);
+  const t = now();
+  return {
+    byStatus: by, total: all.length, posted: posted.length,
+    queueDepth: (by.queued || 0) + (by.retrying || 0) + (by.processing || 0),
+    postedLastMinute: posted.filter((m) => t - m.postedAt < 60000).length,
+    within5MinPct: lat.length ? round2(lat.filter((x) => x <= 300000).length / lat.length * 100) : null,
+    p95LatencyMs: lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * 0.95))] : null,
+    duplicates: counters.duplicates, rejected: counters.rejected, rateLimited: counters.rateLimited,
+    erpInvoices: erp.invoices.length,
+  };
+}
+function erpLabel() {
+  if (erp.mode === 'down') return { key: 'down', text: 'ERP down' };
+  if (erp.sessionExpired) return { key: 'expired', text: 'ERP session expired' };
+  if (breaker.state === 'open') return { key: 'down', text: 'Circuit open' };
+  if (erp.mode === 'flaky') return { key: 'flaky', text: 'ERP flaky' };
+  return { key: 'up', text: 'ERP online' };
 }
 function state() {
-  const recent = order.slice(-150).reverse().map((id) => messages.get(id)).filter(Boolean);
-  const list = (st) => order.map((id) => messages.get(id)).filter((m) => m && m.status === st).slice(-50).map(view);
-  const prices = order.map((id) => messages.get(id)).filter((m) => m && m.type === 'price').slice(-5).reverse().map((m) => ({ id: m.id, ...m.payload, createdAt: m.createdAt, deliveries: m.deliveries }));
+  const all = order.map((id) => messages.get(id)).filter(Boolean);
+  const list = (st) => all.filter((m) => m.status === st).slice(-100).reverse().map(view);
+  const prices = priceChanges.slice(-12).reverse().map((r) => {
+    const m = r.messageId ? messages.get(r.messageId) : null;
+    return { ...r, deliveries: m ? m.deliveries : null };
+  });
   return {
     time: iso(), config: { retryScale: SCALE, retrySchedule: BASE_DELAYS, maxAttempts: MAX_ATTEMPTS, rateLimitPerMin: RATE_LIMIT_PER_MIN },
-    stats: stats(), erp: { mode: erp.mode, sessionExpired: erp.sessionExpired }, breaker: { state: breaker.state, reopenInMs: breaker.state === 'open' ? Math.max(0, breaker.until - now()) : 0 },
-    messages: recent.map(view), dlq: list('dlq'), review: list('review'), recons: recons.slice(0, 6), prices,
+    stats: stats(), erp: { mode: erp.mode, sessionExpired: erp.sessionExpired, ...erpLabel() },
+    breaker: { state: breaker.state, reopenInMs: breaker.state === 'open' ? Math.max(0, breaker.until - now()) : 0 },
+    counts: { messages: all.length, dlq: all.filter((m) => m.status === 'dlq').length, review: all.filter((m) => m.status === 'review').length, prices: priceChanges.filter((r) => r.status === 'pending').length },
+    items: Object.entries(erp.items).map(([code, it]) => ({ code, label: itemLabel(it), price: itemPrice(it) })), today: dayAt(now()),
+    messages: all.slice(-300).reverse().map(view), dlq: list('dlq'), review: list('review'), recons: recons.slice(0, 6), prices,
     stock: Object.fromEntries(BRANCHES.map((b) => [b, round3(erp.stock[b]['ITM-1042'].reduce((s, x) => s + x.qty, 0))])),
   };
 }
@@ -509,38 +631,56 @@ const AGENT = { SUCAT: 'agent-sucat', ZAPOTE: 'agent-zapote', '4TH_ESTATE': 'age
 const TERMINAL = { SUCAT: 'POS18-S311', ZAPOTE: 'POS03-Z101', '4TH_ESTATE': 'POS02-F201' };
 let invoiceCounter = 100000 + Math.floor(Math.random() * 800000);
 const nextInv = () => '00-' + String(++invoiceCounter).padStart(6, '0');
+function safeTime(ms) { return nearMidnight(ms) ? ms + 3 * MIDNIGHT_GUARD_MS : ms; } // keep ordinary demo sales away from the midnight hold
 function makeSale(branch, over = {}) {
-  const sku = Object.keys(SKU_MAP)[Math.floor(Math.random() * 4) + 1];
+  const sku = BASE_SKUS[Math.floor(Math.random() * BASE_SKUS.length)];
   const qty = 1 + Math.floor(Math.random() * 3);
-  return { terminal: TERMINAL[branch], invoice_no: nextInv(), pos_transaction_no: nextInv(), timestamp: iso(), tender_type: 'Cash', lines: [{ sku, qty }], ...over };
+  const amount = round2(qty * itemPrice(erp.items[BASE_SKU_MAP[sku]]));
+  return { terminal: TERMINAL[branch], invoice_no: nextInv(), pos_transaction_no: nextInv(), timestamp: iso(safeTime(now())), tender_type: 'Cash', lines: [{ sku, qty, amount }], ...over };
 }
 async function sendSales(branch, sales) { return (await gw(AGENT[branch], '/v1/sales', { sales })).json.results; }
+function simulateAgentAcks(messageId) {
+  // the branch agents poll for price updates and acknowledge them, as the real agents would
+  for (const b of BRANCHES) setTimeout(async () => {
+    try {
+      const u = await gw(AGENT[b], '/v1/price-updates', null, 'GET');
+      for (const x of u.json.updates) if (x.id === messageId) await gw(AGENT[b], `/v1/price-updates/${x.id}/ack`, {});
+    } catch { /* demo agent */ }
+  }, 800 + Math.random() * 2200);
+}
+const pad = (n) => String(n).padStart(2, '0');
 
 const SCENARIOS = {
-  normal: { label: 'Send 5 ordinary sales', tc: 'F1', run: async () => { const b = BRANCHES[Math.floor(Math.random() * 3)]; return { branch: b, results: await sendSales(b, Array.from({ length: 5 }, () => makeSale(b))) }; } },
-  weighed: { label: 'Sell 0.30 kg of pork (barcode price 135.00)', tc: 'TC1', run: async () => {
+  normal: { label: 'Ordinary sales', sub: 'Five normal sales from one branch', tc: 'F1', run: async () => { const b = BRANCHES[Math.floor(Math.random() * 3)]; return { branch: b, results: await sendSales(b, Array.from({ length: 5 }, () => makeSale(b))) }; } },
+  weighed: { label: 'Weighed barcode', sub: 'Pork sold by the kilo, 0.30 kg', tc: 'TC1', run: async () => {
     const barcode = weighedBarcode('000042', 135);
-    return { barcode, results: await sendSales('SUCAT', [makeSale('SUCAT', { lines: [{ barcode }] })]) };
+    return { barcode, results: await sendSales('SUCAT', [makeSale('SUCAT', { lines: [{ barcode, description: 'Pork liempo' }] })]) };
   } },
-  duplicate: { label: 'Resend one invoice 3 times', tc: 'TC2', run: async () => { const s = makeSale('SUCAT'); const out = []; for (let i = 0; i < 3; i++) out.push(...await sendSales('SUCAT', [s])); return { results: out }; } },
-  outage: { label: 'Replay 500 sales buffered during a 4 hour outage', tc: 'TC3', run: async (o) => {
+  duplicate: { label: 'Duplicate sale', sub: 'Same receipt sent three times', tc: 'TC2', run: async () => { const s = makeSale('SUCAT'); const out = []; for (let i = 0; i < 3; i++) out.push(...await sendSales('SUCAT', [s])); return { results: out }; } },
+  replay: { label: 'Outage replay', sub: '500 sales sent after a 4 hour outage', tc: 'TC3', run: async (o) => {
     const n = Number(o.count) || 500; const branch = 'SUCAT'; const start = now() - 4 * 3600 * 1000; const buf = [];
-    for (let i = 0; i < n; i++) buf.push(makeSale(branch, { timestamp: iso(start + Math.floor(i * (4 * 3600 * 1000) / n)) }));
+    for (let i = 0; i < n; i++) buf.push(makeSale(branch, { timestamp: iso(safeTime(start + Math.floor(i * (4 * 3600 * 1000) / n))) }));
     (async () => { for (let i = 0; i < buf.length; i += 50) { await sendSales(branch, buf.slice(i, i + 50)); await new Promise((r) => setTimeout(r, 150)); } })();
     return { buffered: n, note: 'agent is replaying in batches of 50, oldest first' };
   } },
-  promo: { label: 'Approve a pork price change in the ERP', tc: 'TC4', run: async () => {
+  promo: { label: 'Price change', sub: 'Pork price changes now, cooking oil changes tomorrow', tc: 'TC4', run: async () => {
     const price = 450 + Math.floor(Math.random() * 40);
     const r = await gw('erp-admin', '/v1/prices', { item_code: 'ITM-1042', price });
-    for (const b of BRANCHES) setTimeout(async () => {
-      try { const u = await gw(AGENT[b], '/v1/price-updates', null, 'GET'); for (const x of u.json.updates) await gw(AGENT[b], `/v1/price-updates/${x.id}/ack`, {}); } catch { /* demo agent */ }
-    }, 800 + Math.random() * 2200);
-    return { id: r.json.id, price };
+    const tomorrow = dayAt(now() + 24 * 3600 * 1000);
+    const later = await gw('erp-admin', '/v1/prices', { item_code: 'ITM-6001', price: 98 + 4 + Math.floor(Math.random() * 6), starts_on: tomorrow });
+    return { id: r.json.id, price, pending: later.json.id, startsOn: tomorrow };
   } },
-  unmapped: { label: 'Send a sale with an unmapped SKU', tc: 'TC5', run: async () => ({ results: await sendSales('4TH_ESTATE', [makeSale('4TH_ESTATE', { lines: [{ sku: 'ZZZ-9999', qty: 1 }] })]) }) },
-  midnight: { label: 'Sell at 11:59:59 PM and 12:00:01 AM in Zapote', tc: 'TC6', run: async () => ({ results: await sendSales('ZAPOTE', [
-    makeSale('ZAPOTE', { timestamp: '2026-11-15T15:59:59Z' }), makeSale('ZAPOTE', { timestamp: '2026-11-15T16:00:01Z' })]) }) },
-  card: { label: 'Debit card sale that the POS labels "Credit Card"', tc: 'TC7', run: async () => ({ results: await sendSales('SUCAT', [makeSale('SUCAT', { tender_type: 'Credit Card', approval_code: String(100000 + Math.floor(Math.random() * 899999)) })]) }) },
+  unmapped: { label: 'Unknown product code', sub: 'POS code 480012 has no SKU match', tc: 'TC5', run: async () => ({ results: await sendSales('ZAPOTE', [makeSale('ZAPOTE', { lines: [{ sku: '480012', description: 'Pork liempo slab', qty: 1 }] })]) }) },
+  midnight: { label: 'Sale at midnight', sub: 'Two sales either side of 12:00 AM in Zapote', tc: 'TC6', run: async () => {
+    const boundary = Date.parse(dayAt(now()) + 'T00:00:00Z') - TZ_OFFSET_MS; // 12:00 AM Philippine time today
+    return { results: await sendSales('ZAPOTE', [makeSale('ZAPOTE', { timestamp: iso(boundary - 1000) }), makeSale('ZAPOTE', { timestamp: iso(boundary + 1000) })]) };
+  } },
+  card: { label: 'Debit labelled Credit Card', sub: 'Approval code must survive the label', tc: 'TC7', run: async () => ({ results: await sendSales('SUCAT', [makeSale('SUCAT', { tender_type: 'Credit Card', approval_code: String(100000 + Math.floor(Math.random() * 899999)) })]) }) },
+  outage: { label: 'ERP outage', sub: 'Retry, then dead-letter', tc: null, run: async () => {
+    erp.mode = 'down';
+    const barcode = weighedBarcode('000042', 607.5); // 1.35 kg
+    return { erp: 'down', results: await sendSales('SUCAT', [makeSale('SUCAT', { lines: [{ barcode, description: 'Pork belly' }] })]), note: 'Set the ERP back to Up, then retry the dead-lettered message' };
+  } },
 };
 
 async function sim(req, res, url) {
@@ -552,7 +692,8 @@ async function sim(req, res, url) {
     return send(res, 200, { mode: erp.mode, sessionExpired: erp.sessionExpired });
   }
   if (url.pathname === '/sim/reset') {
-    erp = freshErp(); messages = new Map(); order = []; keyIndex = new Map(); recons = [];
+    erp = freshErp(); messages = new Map(); order = []; keyIndex = new Map(); recons = []; priceChanges = []; seq = 1000;
+    SKU_MAP = { ...BASE_SKU_MAP }; WEIGHED_MAP = { ...BASE_WEIGHED_MAP };
     counters = { duplicates: 0, rejected: 0, rateLimited: 0 }; breaker = { state: 'closed', fails: [], until: 0, probing: false };
     return send(res, 200, { ok: true });
   }
@@ -565,6 +706,10 @@ async function sim(req, res, url) {
       try { rows.push({ invoice_no: m.payload.invoice_no, total: transformSale(m).DocTotal }); } catch { /* invalid sale has no total */ } } }
     if (!rows.length) return send(res, 400, { error: `No sales for ${branch} on ${date}` });
     return send(res, 200, (await gw(AGENT[branch], '/v1/reconciliation', { business_date: date, rows })).json);
+  }
+  if (url.pathname === '/sim/price') {
+    const r = await gw('erp-admin', '/v1/prices', { item_code: body.item_code, price: body.price, starts_on: body.starts_on || undefined });
+    return send(res, r.status, r.json);
   }
   const m = url.pathname.match(/^\/sim\/run\/([a-z]+)$/);
   if (m && SCENARIOS[m[1]]) return send(res, 200, await SCENARIOS[m[1]].run(body));
@@ -579,16 +724,46 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(indexHtml()); }
     if (url.pathname === '/health') return send(res, 200, { ok: true });
     if (url.pathname === '/api/state' && req.method === 'GET') return send(res, 200, state());
-    if (url.pathname === '/api/scenarios' && req.method === 'GET') return send(res, 200, Object.entries(SCENARIOS).map(([id, s]) => ({ id, label: s.label, tc: s.tc })));
+    if (url.pathname === '/api/scenarios' && req.method === 'GET') return send(res, 200, Object.entries(SCENARIOS).map(([id, s]) => ({ id, label: s.label, sub: s.sub, tc: s.tc })));
+    if (url.pathname === '/api/reconciliation' && req.method === 'GET') return send(res, 200, reconciliation(url.searchParams.get('branch') || 'SUCAT', url.searchParams.get('date')));
+    if (url.pathname === '/api/dlq/retry-all' && req.method === 'POST') {
+      let n = 0; for (const id of order) { const m = messages.get(id); if (m && m.status === 'dlq') { requeue(m, 'manual replay requested (retry all)'); n += 1; } }
+      return send(res, 200, { retried: n });
+    }
+    const act = url.pathname.match(/^\/api\/messages\/([^/]+)\/(replay|decide|discard)$/);
+    if (act && req.method === 'POST') {
+      const m = messages.get(act[1]);
+      if (!m) return send(res, 404, { error: 'Unknown message' });
+      if (act[2] === 'replay') {
+        if (m.status !== 'dlq' && m.status !== 'review') return send(res, 404, { error: 'Only dead-letter or review messages can be replayed' });
+        requeue(m, 'manual replay requested'); return send(res, 200, { ok: true });
+      }
+      if (act[2] === 'discard') {
+        if (m.status !== 'dlq') return send(res, 409, { error: 'Only dead-letter messages can be discarded' });
+        m.status = 'discarded'; log(m, 'discarded by an operator'); return send(res, 200, { ok: true });
+      }
+      const body = await readJson(req);
+      if (m.status !== 'review') return send(res, 409, { error: 'Message is not waiting for a decision' });
+      if (body.action === 'reject') { m.status = 'rejected'; log(m, 'rejected by an operator'); return send(res, 200, { ok: true }); }
+      if (body.action === 'accept-mapping') {
+        const r = m.review;
+        if (!r || r.kind !== 'unmapped' || !r.suggestion) return send(res, 400, { error: 'This message has no suggested mapping' });
+        if (r.weighed) WEIGHED_MAP[r.sku] = r.suggestion.itemCode; else SKU_MAP[r.sku] = r.suggestion.itemCode;
+        let n = 0;
+        for (const id of order) {
+          const o = messages.get(id);
+          if (o && o.status === 'review' && o.review && o.review.kind === 'unmapped' && o.review.sku === r.sku && o.review.weighed === r.weighed) { requeue(o, `mapping accepted: ${r.sku} is ${r.suggestion.itemName}`); n += 1; }
+        }
+        return send(res, 200, { ok: true, requeued: n });
+      }
+      if (body.action === 'use-day') {
+        if (!m.review || m.review.kind !== 'midnight' || !m.review.days.includes(body.day)) return send(res, 400, { error: 'day must be one of the two offered days' });
+        m.dayChoice = body.day; requeue(m, `business day set to ${body.day} by an operator`); return send(res, 200, { ok: true });
+      }
+      return send(res, 400, { error: 'action must be accept-mapping, reject or use-day' });
+    }
     const one = url.pathname.match(/^\/api\/messages\/([^/]+)$/);
     if (one && req.method === 'GET') { const m = messages.get(one[1]); return m ? send(res, 200, { ...view(m), payload: m.payload, result: m.result, history: m.history }) : send(res, 404, { error: 'Unknown message' }); }
-    const rep = url.pathname.match(/^\/api\/messages\/([^/]+)\/replay$/);
-    if (rep && req.method === 'POST') {
-      const m = messages.get(rep[1]);
-      if (!m || (m.status !== 'dlq' && m.status !== 'review')) return send(res, 404, { error: 'Only dead-letter or review messages can be replayed' });
-      m.status = 'queued'; m.attempts = 0; m.nextAt = 0; m.error = null; log(m, 'manual replay requested');
-      return send(res, 200, { ok: true });
-    }
     if (url.pathname.startsWith('/sap/b1s/v1/')) return await sapRoute(req, res, url);
     if (url.pathname.startsWith('/sim/')) return await sim(req, res, url);
     if (url.pathname === '/oauth/token' || url.pathname.startsWith('/v1/')) return await gateway(req, res, url);
